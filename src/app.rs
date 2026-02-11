@@ -23,6 +23,17 @@ pub enum CliCommand {
     Remove {
         dependency: String,
     },
+    Search {
+        dependency: String,
+    },
+    Download {
+        dependency: String,
+        version: String,
+    },
+    Deps {
+        dependency: String,
+        version: String,
+    },
 }
 
 pub fn run(provider: &dyn ConanProvider, project_root: &Path, command: CliCommand) -> Result<()> {
@@ -83,6 +94,32 @@ pub fn run(provider: &dyn ConanProvider, project_root: &Path, command: CliComman
             };
 
             apply_all_changes(project_root, &metadata)?;
+        }
+        CliCommand::Search { dependency } => {
+            let matches = provider.search_dependencies(&dependency)?;
+            for reference in matches {
+                println!("{}", reference.to_ref_string());
+            }
+        }
+        CliCommand::Download {
+            dependency,
+            version,
+        } => {
+            let downloaded =
+                provider.download_dependency_archives(&dependency, &version, project_root)?;
+            for artifact in downloaded {
+                println!("{} {}", artifact.arch, artifact.path.display());
+            }
+        }
+        CliCommand::Deps {
+            dependency,
+            version,
+        } => {
+            let dependencies =
+                provider.resolve_dependencies_without_conan(&dependency, &version)?;
+            for reference in dependencies {
+                println!("{}", reference.to_ref_string());
+            }
         }
     }
 
@@ -213,11 +250,13 @@ mod tests {
     use super::{CliCommand, run};
     use crate::conan::ConanProvider;
     use crate::files;
-    use crate::model::{ConanRef, ProjectMetadata};
+    use crate::model::{ConanRef, DownloadArtifact, ProjectMetadata};
 
     struct FakeProvider {
         latest_versions: HashMap<String, String>,
         metadata_by_names: HashMap<String, ProjectMetadata>,
+        available_versions_by_name: HashMap<String, Vec<String>>,
+        dependencies_by_ref: HashMap<String, Vec<ConanRef>>,
     }
 
     impl FakeProvider {
@@ -229,6 +268,76 @@ mod tests {
     }
 
     impl ConanProvider for FakeProvider {
+        fn search_dependencies(&self, query: &str) -> Result<Vec<ConanRef>> {
+            let query_norm = query.to_lowercase();
+            let mut names: Vec<String> = self
+                .available_versions_by_name
+                .keys()
+                .filter(|name| name.to_lowercase().contains(&query_norm))
+                .cloned()
+                .collect();
+            names.sort();
+
+            if names.is_empty() {
+                return Err(anyhow!("Пакеты по запросу '{query}' не найдены"));
+            }
+
+            let mut refs = Vec::new();
+            for name in names {
+                let versions = self
+                    .available_versions_by_name
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Пакет {name} не найден"))?;
+
+                for version in versions {
+                    refs.push(ConanRef {
+                        name: name.clone(),
+                        version,
+                        user: "aurora".to_string(),
+                    });
+                }
+            }
+
+            Ok(refs)
+        }
+
+        fn list_dependency_versions(&self, name: &str) -> Result<Vec<String>> {
+            self.available_versions_by_name
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow!("Пакет {name} не найден"))
+        }
+
+        fn download_dependency_archives(
+            &self,
+            package_name: &str,
+            version: &str,
+            destination_root: &Path,
+        ) -> Result<Vec<DownloadArtifact>> {
+            let versions = self
+                .available_versions_by_name
+                .get(package_name)
+                .ok_or_else(|| anyhow!("Пакет {package_name} не найден"))?;
+            if !versions.iter().any(|candidate| candidate == version) {
+                return Err(anyhow!("Версия {version} для {package_name} не найдена"));
+            }
+
+            let download_dir = destination_root
+                .join("downloads")
+                .join(package_name)
+                .join(version);
+            fs::create_dir_all(&download_dir)?;
+
+            let file = download_dir.join(format!("{package_name}-{version}-armv8.tgz"));
+            fs::write(&file, b"fake")?;
+
+            Ok(vec![DownloadArtifact {
+                arch: "armv8".to_string(),
+                path: file,
+            }])
+        }
+
         fn resolve_direct_dependency(
             &self,
             _project_root: &Path,
@@ -249,6 +358,18 @@ mod tests {
                 version,
                 user: "aurora".to_string(),
             })
+        }
+
+        fn resolve_dependencies_without_conan(
+            &self,
+            package_name: &str,
+            version: &str,
+        ) -> Result<Vec<ConanRef>> {
+            let key = format!("{package_name}/{version}");
+            self.dependencies_by_ref
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| anyhow!("Зависимости для {key} не настроены"))
         }
 
         fn resolve_project_metadata(
@@ -351,6 +472,32 @@ Test app
                     },
                 ),
             ]),
+            available_versions_by_name: HashMap::from([
+                (
+                    "ffmpeg".to_string(),
+                    vec!["6.1.1".to_string(), "6.1.0".to_string()],
+                ),
+                (
+                    "onnx".to_string(),
+                    vec!["1.16.0".to_string(), "1.15.0".to_string()],
+                ),
+                ("onnxruntime".to_string(), vec!["1.18.1".to_string()]),
+            ]),
+            dependencies_by_ref: HashMap::from([(
+                "onnxruntime/1.18.1".to_string(),
+                vec![
+                    ConanRef {
+                        name: "onnx".to_string(),
+                        version: "1.16.0".to_string(),
+                        user: "aurora".to_string(),
+                    },
+                    ConanRef {
+                        name: "ms-gsl".to_string(),
+                        version: "4.0.0".to_string(),
+                        user: "aurora".to_string(),
+                    },
+                ],
+            )]),
         };
 
         Ok((temp, provider))
@@ -511,6 +658,85 @@ Test app
         unsafe {
             std::env::remove_var("AURORA_CONAN_CLI_STATE_DIR");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn search_returns_versions_for_known_package() -> Result<()> {
+        let (project, provider) = setup_project()?;
+        run(
+            &provider,
+            project.path(),
+            CliCommand::Search {
+                dependency: "onnx".to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn search_fails_for_unknown_package() -> Result<()> {
+        let (project, provider) = setup_project()?;
+        let err = run(
+            &provider,
+            project.path(),
+            CliCommand::Search {
+                dependency: "unknown".to_string(),
+            },
+        )
+        .expect_err("expected search to fail for unknown package");
+
+        assert!(err.to_string().contains("не найден"));
+        Ok(())
+    }
+
+    #[test]
+    fn download_creates_artifact_for_selected_version() -> Result<()> {
+        let (project, provider) = setup_project()?;
+        run(
+            &provider,
+            project.path(),
+            CliCommand::Download {
+                dependency: "onnxruntime".to_string(),
+                version: "1.18.1".to_string(),
+            },
+        )?;
+
+        let artifact = project
+            .path()
+            .join("downloads/onnxruntime/1.18.1/onnxruntime-1.18.1-armv8.tgz");
+        assert!(artifact.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn deps_returns_dependencies_for_selected_package_version() -> Result<()> {
+        let (project, provider) = setup_project()?;
+        run(
+            &provider,
+            project.path(),
+            CliCommand::Deps {
+                dependency: "onnxruntime".to_string(),
+                version: "1.18.1".to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn deps_fails_for_unknown_package_version() -> Result<()> {
+        let (project, provider) = setup_project()?;
+        let err = run(
+            &provider,
+            project.path(),
+            CliCommand::Deps {
+                dependency: "unknown".to_string(),
+                version: "0.0.1".to_string(),
+            },
+        )
+        .expect_err("expected deps to fail for unknown package version");
+
+        assert!(err.to_string().contains("не настроены"));
         Ok(())
     }
 }

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConanRef {
     pub name: String,
@@ -15,4 +17,10 @@ impl ConanRef {
 pub struct ProjectMetadata {
     pub direct_pkg_modules: Vec<String>,
     pub shared_lib_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadArtifact {
+    pub arch: String,
+    pub path: PathBuf,
 }

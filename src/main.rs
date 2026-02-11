@@ -44,6 +44,15 @@ enum Commands {
 
     /// Удаляет зависимость из conanfile.py и пересчитывает CMake/.spec.
     Remove { dependency: String },
+
+    /// Показывает список доступных версий пакета.
+    Search { dependency: String },
+
+    /// Скачивает архивы пакета указанной версии.
+    Download { dependency: String, version: String },
+
+    /// Показывает итоговый список зависимостей пакета без использования conan.
+    Deps { dependency: String, version: String },
 }
 
 fn main() {
@@ -70,6 +79,21 @@ fn run_main() -> Result<()> {
             version,
         },
         Commands::Remove { dependency } => CliCommand::Remove { dependency },
+        Commands::Search { dependency } => CliCommand::Search { dependency },
+        Commands::Download {
+            dependency,
+            version,
+        } => CliCommand::Download {
+            dependency,
+            version,
+        },
+        Commands::Deps {
+            dependency,
+            version,
+        } => CliCommand::Deps {
+            dependency,
+            version,
+        },
     };
 
     app::run(&provider, &project_root, command)
