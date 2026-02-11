@@ -1,7 +1,9 @@
 mod app;
+mod clear_store;
 mod conan;
 mod connection;
 mod files;
+mod mode;
 mod model;
 
 use std::env;
@@ -35,6 +37,9 @@ enum Commands {
 
     /// Подготавливает структуру Conan-интеграции в проекте.
     Init,
+
+    /// Подготавливает структуру clear-интеграции (без использования Conan CLI).
+    InitClear,
 
     /// Добавляет зависимость в conanfile.py и обновляет CMake/.spec.
     Add {
@@ -71,6 +76,7 @@ fn run_main() -> Result<()> {
         Commands::Connect { mode, dir } => CliCommand::Connect { mode, dir },
         Commands::Disconnect => CliCommand::Disconnect,
         Commands::Init => CliCommand::Init,
+        Commands::InitClear => CliCommand::InitClear,
         Commands::Add {
             dependency,
             version,

@@ -1,11 +1,15 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
+use console::style;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
+use crate::clear_store::{self, ClearManifest};
 use crate::conan::ConanProvider;
 use crate::connection::{self, Connection, ConnectionMode};
 use crate::files;
+use crate::mode::{self, ProjectMode};
 use crate::model::{ConanRef, ProjectMetadata};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +20,7 @@ pub enum CliCommand {
     },
     Disconnect,
     Init,
+    InitClear,
     Add {
         dependency: String,
         version: Option<String>,
@@ -40,60 +45,14 @@ pub fn run(provider: &dyn ConanProvider, project_root: &Path, command: CliComman
     match command {
         CliCommand::Connect { mode, dir } => connect(mode, dir)?,
         CliCommand::Disconnect => disconnect()?,
-        CliCommand::Init => {
-            ensure_project_files_exist(project_root)?;
-            files::write_conanfile(project_root, &[])?;
-            apply_all_changes(
-                project_root,
-                &ProjectMetadata {
-                    direct_pkg_modules: Vec::new(),
-                    shared_lib_patterns: Vec::new(),
-                },
-            )?;
-        }
+        CliCommand::Init => init_conan_mode(project_root)?,
+        CliCommand::InitClear => init_clear_mode(project_root)?,
         CliCommand::Add {
             dependency,
             version,
-        } => {
-            ensure_project_files_exist(project_root)?;
-            let mut current = files::read_requires(project_root)?;
-            let resolved = provider.resolve_direct_dependency(
-                project_root,
-                &dependency,
-                version.as_deref(),
-            )?;
-            upsert_reference(&mut current, resolved);
-
-            files::write_conanfile(project_root, &current)?;
-
-            let metadata = provider.resolve_project_metadata(project_root, &current)?;
-            apply_all_changes(project_root, &metadata)?;
-        }
+        } => add_dependency(provider, project_root, &dependency, version.as_deref())?,
         CliCommand::Remove { dependency } => {
-            ensure_project_files_exist(project_root)?;
-            let mut current = files::read_requires(project_root)?;
-            let before = current.len();
-            current.retain(|item| item.name != dependency);
-
-            if current.len() == before {
-                return Err(anyhow!(
-                    "Зависимость {} не найдена в conanfile.py",
-                    dependency
-                ));
-            }
-
-            files::write_conanfile(project_root, &current)?;
-
-            let metadata = if current.is_empty() {
-                ProjectMetadata {
-                    direct_pkg_modules: Vec::new(),
-                    shared_lib_patterns: Vec::new(),
-                }
-            } else {
-                provider.resolve_project_metadata(project_root, &current)?
-            };
-
-            apply_all_changes(project_root, &metadata)?;
+            remove_dependency(provider, project_root, &dependency)?
         }
         CliCommand::Search { dependency } => {
             let matches = provider.search_dependencies(&dependency)?;
@@ -124,6 +83,340 @@ pub fn run(provider: &dyn ConanProvider, project_root: &Path, command: CliComman
     }
 
     Ok(())
+}
+
+fn init_conan_mode(project_root: &Path) -> Result<()> {
+    ensure_project_files_exist(project_root)?;
+    mode::save_mode(project_root, ProjectMode::Conan)?;
+    files::write_conanfile(project_root, &[])?;
+    apply_conan_changes(
+        project_root,
+        &ProjectMetadata {
+            direct_pkg_modules: Vec::new(),
+            shared_lib_patterns: Vec::new(),
+        },
+    )?;
+    Ok(())
+}
+
+fn init_clear_mode(project_root: &Path) -> Result<()> {
+    ensure_project_files_exist(project_root)?;
+    mode::save_mode(project_root, ProjectMode::Clear)?;
+    clear_store::ensure_layout(project_root)?;
+    clear_store::save_manifest(project_root, &ClearManifest::default())?;
+
+    let conanfile = project_root.join(files::CONANFILE);
+    if conanfile.exists() {
+        std::fs::remove_file(&conanfile)
+            .with_context(|| format!("Не удалось удалить {}", conanfile.display()))?;
+    }
+
+    apply_clear_changes(
+        project_root,
+        &ProjectMetadata {
+            direct_pkg_modules: Vec::new(),
+            shared_lib_patterns: Vec::new(),
+        },
+    )?;
+    Ok(())
+}
+
+fn add_dependency(
+    provider: &dyn ConanProvider,
+    project_root: &Path,
+    dependency: &str,
+    version: Option<&str>,
+) -> Result<()> {
+    let progress = create_progress_bar(4, format!("add {}{}", dependency, version_suffix(version)));
+    progress_step(&progress, "Validating project structure");
+    ensure_project_files_exist(project_root)?;
+
+    progress_step(&progress, "Detecting project mode");
+    let mode = mode::detect_mode(project_root, files::CONANFILE)?;
+
+    progress_step(&progress, "Resolving dependency version");
+    let resolved = provider.resolve_direct_dependency(project_root, dependency, version)?;
+    log_info(
+        Some(&progress),
+        &format!(
+            "Applying dependency {} in {} mode",
+            resolved.to_ref_string(),
+            mode_label(mode)
+        ),
+    );
+
+    progress_step(&progress, "Applying project changes");
+    match mode {
+        ProjectMode::Conan => {
+            let mut current = files::read_requires(project_root)?;
+            upsert_reference(&mut current, resolved);
+            files::write_conanfile(project_root, &current)?;
+            let metadata = provider.resolve_project_metadata(project_root, &current)?;
+            apply_conan_changes(project_root, &metadata)?;
+        }
+        ProjectMode::Clear => {
+            let mut manifest = clear_store::load_manifest(project_root)?;
+            upsert_reference(&mut manifest.direct_requires, resolved);
+            clear_store::save_manifest(project_root, &manifest)?;
+            sync_clear_mode(
+                provider,
+                project_root,
+                &manifest.direct_requires,
+                Some(&progress),
+            )?;
+        }
+    }
+
+    progress.finish_with_message(format!(
+        "{} add completed: {}{}",
+        style("✔").green(),
+        dependency,
+        version_suffix(version)
+    ));
+    log_success(Some(&progress), "Dependency added successfully");
+    Ok(())
+}
+
+fn remove_dependency(
+    provider: &dyn ConanProvider,
+    project_root: &Path,
+    dependency: &str,
+) -> Result<()> {
+    let progress = create_progress_bar(4, format!("remove {}", dependency));
+    progress_step(&progress, "Validating project structure");
+    ensure_project_files_exist(project_root)?;
+
+    progress_step(&progress, "Detecting project mode");
+    let mode = mode::detect_mode(project_root, files::CONANFILE)?;
+    log_info(
+        Some(&progress),
+        &format!(
+            "Removing dependency {} in {} mode",
+            dependency,
+            mode_label(mode)
+        ),
+    );
+
+    progress_step(&progress, "Updating dependency state");
+    match mode {
+        ProjectMode::Conan => {
+            let mut current = files::read_requires(project_root)?;
+            let before = current.len();
+            current.retain(|item| item.name != dependency);
+            if current.len() == before {
+                return Err(anyhow!(
+                    "Зависимость {} не найдена в conanfile.py",
+                    dependency
+                ));
+            }
+
+            files::write_conanfile(project_root, &current)?;
+            let metadata = if current.is_empty() {
+                ProjectMetadata {
+                    direct_pkg_modules: Vec::new(),
+                    shared_lib_patterns: Vec::new(),
+                }
+            } else {
+                provider.resolve_project_metadata(project_root, &current)?
+            };
+            apply_conan_changes(project_root, &metadata)?;
+        }
+        ProjectMode::Clear => {
+            let mut manifest = clear_store::load_manifest(project_root)?;
+            let before = manifest.direct_requires.len();
+            manifest
+                .direct_requires
+                .retain(|item| item.name != dependency);
+            if manifest.direct_requires.len() == before {
+                return Err(anyhow!(
+                    "Зависимость {} не найдена в thirdparty manifest",
+                    dependency
+                ));
+            }
+
+            clear_store::save_manifest(project_root, &manifest)?;
+            sync_clear_mode(
+                provider,
+                project_root,
+                &manifest.direct_requires,
+                Some(&progress),
+            )?;
+        }
+    }
+
+    progress_step(&progress, "Finalizing");
+    progress.finish_with_message(format!(
+        "{} remove completed: {}",
+        style("✔").green(),
+        dependency
+    ));
+    log_success(Some(&progress), "Dependency removed successfully");
+    Ok(())
+}
+
+fn sync_clear_mode(
+    provider: &dyn ConanProvider,
+    project_root: &Path,
+    direct_refs: &[ConanRef],
+    main_progress: Option<&ProgressBar>,
+) -> Result<()> {
+    log_info(main_progress, "Syncing clear package store");
+    let (target_arches, strict_arch_mode) = clear_store::resolve_target_arches()?;
+    log_info(
+        main_progress,
+        &format!("Target architectures: {}", target_arches.join(", ")),
+    );
+    for arch in &target_arches {
+        clear_store::reset_arch_layout(project_root, arch)?;
+    }
+
+    if direct_refs.is_empty() {
+        apply_clear_changes(
+            project_root,
+            &ProjectMetadata {
+                direct_pkg_modules: Vec::new(),
+                shared_lib_patterns: Vec::new(),
+            },
+        )?;
+        log_info(
+            main_progress,
+            "Clear sync completed: no direct dependencies",
+        );
+        return Ok(());
+    }
+
+    log_info(main_progress, "Building full dependency graph");
+    let all_refs = build_full_dependency_set(provider, direct_refs)?;
+    log_info(
+        main_progress,
+        &format!(
+            "Resolved package count (direct + transitive): {}",
+            all_refs.len()
+        ),
+    );
+    let mut lib_patterns = Vec::new();
+    let arch_ops_total = (all_refs.len() * target_arches.len()).max(1) as u64;
+    let package_progress =
+        create_progress_bar(arch_ops_total, "Downloading and extracting packages");
+
+    for reference in &all_refs {
+        log_info(
+            Some(&package_progress),
+            &format!("Processing {}", reference.to_ref_string()),
+        );
+        let artifacts = provider.download_dependency_archives(
+            &reference.name,
+            &reference.version,
+            project_root,
+        )?;
+        let mut installed_any = false;
+        for arch in &target_arches {
+            package_progress.set_message(format!("{} -> {}", reference.to_ref_string(), arch));
+            let selected = match clear_store::choose_artifact(&artifacts, arch) {
+                Ok(item) => item,
+                Err(error) => {
+                    if strict_arch_mode {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "Не найден артефакт пакета {}/{} для архитектуры {}",
+                                reference.name, reference.version, arch
+                            )
+                        });
+                    }
+                    package_progress.inc(1);
+                    continue;
+                }
+            };
+
+            installed_any = true;
+            let package_dir =
+                clear_store::package_root(project_root, arch, &reference.name, &reference.version);
+            clear_store::extract_tgz(&selected.path, &package_dir)?;
+
+            let libs = clear_store::discover_lib_names(&package_dir)?;
+            for lib in &libs {
+                let pattern = format!("lib{}.*", lib);
+                if !lib_patterns.iter().any(|item| item == &pattern) {
+                    lib_patterns.push(pattern);
+                }
+            }
+            clear_store::write_pkg_config(project_root, arch, reference, &libs, &[])?;
+            package_progress.inc(1);
+        }
+
+        if !installed_any {
+            return Err(anyhow!(
+                "Для пакета '{}' версии '{}' не найдено ни одного подходящего архива",
+                reference.name,
+                reference.version
+            ));
+        }
+    }
+    package_progress.finish_with_message(format!("{} packages synced", style("✔").green()));
+
+    let mut pkg_modules = all_refs
+        .iter()
+        .map(|item| item.name.clone())
+        .collect::<Vec<_>>();
+    pkg_modules.sort();
+    pkg_modules.dedup();
+
+    lib_patterns.sort();
+    lib_patterns.dedup();
+    let module_count = pkg_modules.len();
+    let pattern_count = lib_patterns.len();
+
+    apply_clear_changes(
+        project_root,
+        &ProjectMetadata {
+            direct_pkg_modules: pkg_modules,
+            shared_lib_patterns: lib_patterns,
+        },
+    )?;
+    log_info(
+        main_progress,
+        &format!(
+            "Updated CMake/spec: modules={}, shared_lib_patterns={}",
+            module_count, pattern_count
+        ),
+    );
+    Ok(())
+}
+
+fn build_full_dependency_set(
+    provider: &dyn ConanProvider,
+    direct_refs: &[ConanRef],
+) -> Result<Vec<ConanRef>> {
+    let mut all = direct_refs.to_vec();
+
+    for direct in direct_refs {
+        let resolved =
+            provider.resolve_dependencies_without_conan(&direct.name, &direct.version)?;
+        for item in resolved {
+            if item.version == "error" {
+                return Err(anyhow!(
+                    "Не удалось определить версию транзитивной зависимости {}",
+                    item.name
+                ));
+            }
+
+            if let Some(existing) = all.iter().find(|ref_item| ref_item.name == item.name) {
+                if existing.version != item.version {
+                    return Err(anyhow!(
+                        "Конфликт версий зависимости '{}': {} и {}",
+                        item.name,
+                        existing.version,
+                        item.version
+                    ));
+                }
+                continue;
+            }
+            all.push(item);
+        }
+    }
+
+    all.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
+    Ok(all)
 }
 
 fn connect(mode: Option<String>, dir: Option<String>) -> Result<()> {
@@ -192,9 +485,15 @@ fn upsert_reference(references: &mut Vec<ConanRef>, new_ref: ConanRef) {
     references.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
 }
 
-fn apply_all_changes(project_root: &Path, metadata: &ProjectMetadata) -> Result<()> {
+fn apply_conan_changes(project_root: &Path, metadata: &ProjectMetadata) -> Result<()> {
     files::update_cmake(project_root, metadata)?;
     files::update_spec(project_root, metadata)?;
+    Ok(())
+}
+
+fn apply_clear_changes(project_root: &Path, metadata: &ProjectMetadata) -> Result<()> {
+    files::update_cmake_clear(project_root, metadata)?;
+    files::update_spec_clear(project_root, metadata)?;
     Ok(())
 }
 
@@ -238,13 +537,78 @@ fn prompt_path() -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+fn create_progress_bar(total: u64, message: impl Into<String>) -> ProgressBar {
+    let progress = ProgressBar::new(total);
+    if !io::stderr().is_terminal() {
+        progress.set_draw_target(ProgressDrawTarget::hidden());
+    }
+    let style = ProgressStyle::with_template(
+        "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>3}/{len:3} {msg}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+    .progress_chars("=>-");
+    progress.set_style(style);
+    progress.set_message(message.into());
+    progress
+}
+
+fn progress_step(progress: &ProgressBar, message: &str) {
+    progress.inc(1);
+    progress.set_message(message.to_string());
+    log_info(Some(progress), message);
+}
+
+fn mode_label(mode: ProjectMode) -> &'static str {
+    match mode {
+        ProjectMode::Conan => "conan",
+        ProjectMode::Clear => "clear",
+    }
+}
+
+fn version_suffix(version: Option<&str>) -> String {
+    version.map_or_else(String::new, |value| format!(" {}", value))
+}
+
+#[derive(Clone, Copy)]
+enum LogLevel {
+    Info,
+    Success,
+}
+
+fn log_info(progress: Option<&ProgressBar>, message: &str) {
+    log_with_level(progress, LogLevel::Info, message);
+}
+
+fn log_success(progress: Option<&ProgressBar>, message: &str) {
+    log_with_level(progress, LogLevel::Success, message);
+}
+
+fn log_with_level(progress: Option<&ProgressBar>, level: LogLevel, message: &str) {
+    let prefix = style("[aurora-conan-cli]").dim().bold().to_string();
+    let level_tag = match level {
+        LogLevel::Info => style("INFO").cyan().bold().to_string(),
+        LogLevel::Success => style("SUCCESS").green().bold().to_string(),
+    };
+    let line = format!("{prefix} {level_tag} {message}");
+
+    match progress {
+        Some(pb) => pb.suspend(|| eprintln!("{line}")),
+        None => eprintln!("{line}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::fs::File;
+    use std::io::Cursor;
     use std::path::Path;
 
     use anyhow::{Context, Result, anyhow};
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use tar::{Builder, Header};
     use tempfile::TempDir;
 
     use super::{CliCommand, run};
@@ -329,13 +693,28 @@ mod tests {
                 .join(version);
             fs::create_dir_all(&download_dir)?;
 
-            let file = download_dir.join(format!("{package_name}-{version}-armv8.tgz"));
-            fs::write(&file, b"fake")?;
+            let armv8_file = download_dir.join(format!("{package_name}-{version}-armv8.tgz"));
+            create_test_tgz(&armv8_file, package_name, true)?;
+            let x86_64_file = download_dir.join(format!("{package_name}-{version}-x86_64.tgz"));
+            create_test_tgz(&x86_64_file, package_name, true)?;
 
-            Ok(vec![DownloadArtifact {
-                arch: "armv8".to_string(),
-                path: file,
-            }])
+            let package_file = download_dir.join(format!("{package_name}-{version}-package.tgz"));
+            create_test_tgz(&package_file, package_name, false)?;
+
+            Ok(vec![
+                DownloadArtifact {
+                    arch: "armv8".to_string(),
+                    path: armv8_file,
+                },
+                DownloadArtifact {
+                    arch: "x86_64".to_string(),
+                    path: x86_64_file,
+                },
+                DownloadArtifact {
+                    arch: "package".to_string(),
+                    path: package_file,
+                },
+            ])
         }
 
         fn resolve_direct_dependency(
@@ -482,6 +861,7 @@ Test app
                     vec!["1.16.0".to_string(), "1.15.0".to_string()],
                 ),
                 ("onnxruntime".to_string(), vec!["1.18.1".to_string()]),
+                ("ms-gsl".to_string(), vec!["4.0.0".to_string()]),
             ]),
             dependencies_by_ref: HashMap::from([(
                 "onnxruntime/1.18.1".to_string(),
@@ -503,6 +883,41 @@ Test app
         Ok((temp, provider))
     }
 
+    fn create_test_tgz(path: &Path, package_name: &str, with_lib: bool) -> Result<()> {
+        let file = File::create(path)?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut tar = Builder::new(encoder);
+
+        append_bytes(
+            &mut tar,
+            format!("include/{package_name}.h").as_str(),
+            b"// test header\n",
+        )?;
+        if with_lib {
+            append_bytes(
+                &mut tar,
+                format!("lib/lib{package_name}.so").as_str(),
+                b"binary-placeholder",
+            )?;
+        }
+
+        tar.finish()?;
+        Ok(())
+    }
+
+    fn append_bytes<W: std::io::Write>(
+        tar: &mut Builder<W>,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let mut header = Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, path, Cursor::new(bytes))?;
+        Ok(())
+    }
+
     #[test]
     fn init_creates_conanfile_and_patches_templates() -> Result<()> {
         let (project, provider) = setup_project()?;
@@ -522,6 +937,30 @@ Test app
         assert!(spec.contains("conan-install-if-modified"));
         assert!(spec.contains("conan-deploy-libraries"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn init_clear_creates_manifest_and_clear_spec_snippets() -> Result<()> {
+        let (project, provider) = setup_project()?;
+        run(&provider, project.path(), CliCommand::InitClear)?;
+
+        assert!(
+            project
+                .path()
+                .join("thirdparty/aurora/manifest.lock.json")
+                .exists()
+        );
+        assert!(!project.path().join("conanfile.py").exists());
+
+        let spec = fs::read_to_string(project.path().join("rpm/ru.auroraos.TestApp.spec"))?;
+        assert!(!spec.contains("BuildRequires:  conan"));
+        assert!(spec.contains("THIRDPARTY_ROOT"));
+
+        let cmake = fs::read_to_string(project.path().join("CMakeLists.txt"))?;
+        assert!(cmake.contains("CMAKE_SYSTEM_PROCESSOR"));
+        assert!(cmake.contains("AURORA_TP_ARCH"));
+        assert!(cmake.contains("AURORA_TP_PKGCONFIG_DIR"));
         Ok(())
     }
 
@@ -737,6 +1176,42 @@ Test app
         .expect_err("expected deps to fail for unknown package version");
 
         assert!(err.to_string().contains("не настроены"));
+        Ok(())
+    }
+
+    #[test]
+    fn add_and_remove_dependency_in_clear_mode_manage_thirdparty_store() -> Result<()> {
+        let (project, provider) = setup_project()?;
+        run(&provider, project.path(), CliCommand::InitClear)?;
+
+        run(
+            &provider,
+            project.path(),
+            CliCommand::Add {
+                dependency: "onnxruntime".to_string(),
+                version: Some("1.18.1".to_string()),
+            },
+        )?;
+
+        let arch_root = project.path().join("thirdparty/aurora/armv8");
+        assert!(arch_root.join("pkgconfig/onnxruntime.pc").exists());
+        assert!(
+            arch_root
+                .join("packages/onnxruntime/1.18.1/lib/libonnxruntime.so")
+                .exists()
+        );
+
+        run(
+            &provider,
+            project.path(),
+            CliCommand::Remove {
+                dependency: "onnxruntime".to_string(),
+            },
+        )?;
+
+        let manifest =
+            fs::read_to_string(project.path().join("thirdparty/aurora/manifest.lock.json"))?;
+        assert!(manifest.contains("\"direct_requires\": []"));
         Ok(())
     }
 }

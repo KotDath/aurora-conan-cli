@@ -216,7 +216,7 @@ impl ConanProvider for CliConanProvider {
 
     fn resolve_project_metadata(
         &self,
-        project_root: &Path,
+        _project_root: &Path,
         direct_refs: &[ConanRef],
     ) -> Result<ProjectMetadata> {
         if direct_refs.is_empty() {
@@ -229,43 +229,22 @@ impl ConanProvider for CliConanProvider {
         let mut direct_modules: Vec<String> = direct_refs.iter().map(|r| r.name.clone()).collect();
         direct_modules.sort();
         direct_modules.dedup();
-
-        let graph_output = run_conan_with_connection(
-            project_root,
-            &[
-                "graph".to_string(),
-                "info".to_string(),
-                project_root.display().to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-            ],
-        )
-        .context("Не удалось получить conan graph info")?;
-
-        let graph_json: Value = serde_json::from_str(&graph_output)
-            .context("Conan graph JSON имеет некорректный формат")?;
-
-        let mut libs = BTreeSet::new();
-        collect_libs(&graph_json, &mut libs);
-
-        let mut patterns: Vec<String> = libs
-            .into_iter()
-            .map(|lib| {
-                if lib.starts_with("lib") {
-                    format!("{lib}.*")
-                } else {
-                    format!("lib{lib}.*")
+        let mut all_packages = BTreeSet::new();
+        for reference in direct_refs {
+            all_packages.insert(reference.name.clone());
+            let transitives =
+                self.resolve_dependencies_without_conan(&reference.name, &reference.version)?;
+            for dep in transitives {
+                if dep.version != ERROR_VERSION {
+                    all_packages.insert(dep.name);
                 }
-            })
-            .collect();
-
-        if patterns.is_empty() {
-            patterns = direct_modules
-                .iter()
-                .map(|module| format!("lib{module}.*"))
-                .collect();
+            }
         }
 
+        let mut patterns = all_packages
+            .into_iter()
+            .map(|name| format!("lib{}.*", name))
+            .collect::<Vec<_>>();
         patterns.sort();
         patterns.dedup();
 

@@ -50,10 +50,27 @@ pub fn write_conanfile(project_root: &Path, refs: &[ConanRef]) -> Result<()> {
 }
 
 pub fn update_cmake(project_root: &Path, metadata: &ProjectMetadata) -> Result<()> {
+    update_cmake_impl(project_root, metadata, false)
+}
+
+pub fn update_cmake_clear(project_root: &Path, metadata: &ProjectMetadata) -> Result<()> {
+    update_cmake_impl(project_root, metadata, true)
+}
+
+fn update_cmake_impl(
+    project_root: &Path,
+    metadata: &ProjectMetadata,
+    clear_mode: bool,
+) -> Result<()> {
     let path = project_root.join(CMAKE_FILE);
     let mut content = read_text(&path)?;
 
     content = ensure_find_package_pkgconfig(&content)?;
+    if clear_mode {
+        content = upsert_block_after_project(&content, "clear-arch", &clear_arch_block())?;
+    } else {
+        content = remove_managed_block(&content, "clear-arch")?;
+    }
 
     let rpath_body = [
         "set(CMAKE_SKIP_RPATH FALSE)",
@@ -107,6 +124,29 @@ pub fn update_cmake(project_root: &Path, metadata: &ProjectMetadata) -> Result<(
     write_text(&path, &content)
 }
 
+fn clear_arch_block() -> String {
+    [
+        "if(CMAKE_SYSTEM_PROCESSOR MATCHES \"^(aarch64|arm64)$\")",
+        "  set(AURORA_TP_ARCH \"armv8\")",
+        "elseif(CMAKE_SYSTEM_PROCESSOR MATCHES \"^(armv7|armv7hl)$\")",
+        "  set(AURORA_TP_ARCH \"armv7\")",
+        "elseif(CMAKE_SYSTEM_PROCESSOR MATCHES \"^(x86_64|amd64)$\")",
+        "  set(AURORA_TP_ARCH \"x86_64\")",
+        "else()",
+        "  message(FATAL_ERROR \"Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}\")",
+        "endif()",
+        "",
+        "set(AURORA_TP_ROOT \"${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/aurora\")",
+        "set(AURORA_TP_PKGCONFIG_DIR \"${AURORA_TP_ROOT}/${AURORA_TP_ARCH}/pkgconfig\")",
+        "if(DEFINED ENV{PKG_CONFIG_PATH} AND NOT \"$ENV{PKG_CONFIG_PATH}\" STREQUAL \"\")",
+        "  set(ENV{PKG_CONFIG_PATH} \"${AURORA_TP_PKGCONFIG_DIR}:$ENV{PKG_CONFIG_PATH}\")",
+        "else()",
+        "  set(ENV{PKG_CONFIG_PATH} \"${AURORA_TP_PKGCONFIG_DIR}\")",
+        "endif()",
+    ]
+    .join("\n")
+}
+
 pub fn update_spec(project_root: &Path, metadata: &ProjectMetadata) -> Result<()> {
     let spec_path = find_spec_file(project_root)?;
     let mut content = read_text(&spec_path)?;
@@ -147,6 +187,62 @@ pub fn update_spec(project_root: &Path, metadata: &ProjectMetadata) -> Result<()
         "SHARED_LIBRARIES=\"%{buildroot}/%{_datadir}/%{name}/lib\"",
         "mkdir -p \"$SHARED_LIBRARIES\"",
         "conan-deploy-libraries \"$EXECUTABLE\" \"$CONAN_LIB_DIR\" \"$SHARED_LIBRARIES\"",
+    ]
+    .join("\n");
+    content = upsert_block_in_section(&content, "install", "install-snippet", &install_body)?;
+
+    write_text(&spec_path, &content)
+}
+
+pub fn update_spec_clear(project_root: &Path, metadata: &ProjectMetadata) -> Result<()> {
+    let spec_path = find_spec_file(project_root)?;
+    let mut content = read_text(&spec_path)?;
+
+    content = upsert_define(&content, "_cmake_skip_rpath", "%{nil}")?;
+    content = upsert_define(
+        &content,
+        "__provides_exclude_from",
+        "^%{_datadir}/%{name}/lib/.*$",
+    )?;
+
+    let mut patterns = metadata.shared_lib_patterns.clone();
+    patterns.sort();
+    patterns.dedup();
+    let requires_pattern = if patterns.is_empty() {
+        "^$".to_string()
+    } else {
+        format!("^({})$", patterns.join("|"))
+    };
+    content = upsert_define(&content, "__requires_exclude", &requires_pattern)?;
+    content = remove_buildrequires_conan(&content)?;
+
+    let build_body = [
+        "THIRDPARTY_ROOT=\"%{_sourcedir}/../thirdparty/aurora\"",
+        "case \"%{_arch}\" in",
+        "  aarch64) AURORA_TP_ARCH=\"armv8\" ;;",
+        "  armv7hl) AURORA_TP_ARCH=\"armv7\" ;;",
+        "  x86_64) AURORA_TP_ARCH=\"x86_64\" ;;",
+        "  *) echo \"Unsupported arch: %{_arch}\" >&2; exit 1 ;;",
+        "esac",
+        "THIRDPARTY_ARCH_DIR=\"$THIRDPARTY_ROOT/$AURORA_TP_ARCH\"",
+        "PKG_CONFIG_PATH=\"$THIRDPARTY_ARCH_DIR/pkgconfig:$PKG_CONFIG_PATH\"",
+        "export PKG_CONFIG_PATH",
+    ]
+    .join("\n");
+    content = upsert_block_in_section(&content, "build", "build-snippet", &build_body)?;
+
+    let install_body = [
+        "THIRDPARTY_ROOT=\"%{_sourcedir}/../thirdparty/aurora\"",
+        "case \"%{_arch}\" in",
+        "  aarch64) AURORA_TP_ARCH=\"armv8\" ;;",
+        "  armv7hl) AURORA_TP_ARCH=\"armv7\" ;;",
+        "  x86_64) AURORA_TP_ARCH=\"x86_64\" ;;",
+        "  *) echo \"Unsupported arch: %{_arch}\" >&2; exit 1 ;;",
+        "esac",
+        "THIRDPARTY_ARCH_DIR=\"$THIRDPARTY_ROOT/$AURORA_TP_ARCH\"",
+        "SHARED_LIBRARIES=\"%{buildroot}/%{_datadir}/%{name}/lib\"",
+        "mkdir -p \"$SHARED_LIBRARIES\"",
+        "find \"$THIRDPARTY_ARCH_DIR/packages\" -type f -name 'lib*.so*' -exec cp -P {} \"$SHARED_LIBRARIES\" \\; 2>/dev/null || true",
     ]
     .join("\n");
     content = upsert_block_in_section(&content, "install", "install-snippet", &install_body)?;
@@ -333,6 +429,12 @@ fn ensure_buildrequires_conan(content: &str) -> Result<String> {
     } else {
         Ok(format!("{content}\nBuildRequires:  conan\n"))
     }
+}
+
+fn remove_buildrequires_conan(content: &str) -> Result<String> {
+    let re = Regex::new(r"(?m)^BuildRequires:.*\bconan\b.*\n?")
+        .context("Не удалось подготовить regex для удаления BuildRequires conan")?;
+    Ok(re.replace_all(content, "").to_string())
 }
 
 fn upsert_block_in_section(content: &str, section: &str, key: &str, body: &str) -> Result<String> {
