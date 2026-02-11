@@ -1,0 +1,76 @@
+mod app;
+mod conan;
+mod connection;
+mod files;
+mod model;
+
+use std::env;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+use crate::app::CliCommand;
+use crate::conan::CliConanProvider;
+
+#[derive(Parser)]
+#[command(name = "aurora-conan-cli")]
+#[command(about = "CLI для управления Conan зависимостями в AuroraOS Qt проектах")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Подключает SDK/PSDK окружение для Conan-операций.
+    Connect {
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long)]
+        dir: Option<String>,
+    },
+
+    /// Отключает сохранённое SDK/PSDK окружение.
+    Disconnect,
+
+    /// Подготавливает структуру Conan-интеграции в проекте.
+    Init,
+
+    /// Добавляет зависимость в conanfile.py и обновляет CMake/.spec.
+    Add {
+        dependency: String,
+        version: Option<String>,
+    },
+
+    /// Удаляет зависимость из conanfile.py и пересчитывает CMake/.spec.
+    Remove { dependency: String },
+}
+
+fn main() {
+    if let Err(error) = run_main() {
+        eprintln!("Ошибка: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run_main() -> Result<()> {
+    let cli = Cli::parse();
+    let project_root = env::current_dir()?;
+    let provider = CliConanProvider;
+
+    let command = match cli.command {
+        Commands::Connect { mode, dir } => CliCommand::Connect { mode, dir },
+        Commands::Disconnect => CliCommand::Disconnect,
+        Commands::Init => CliCommand::Init,
+        Commands::Add {
+            dependency,
+            version,
+        } => CliCommand::Add {
+            dependency,
+            version,
+        },
+        Commands::Remove { dependency } => CliCommand::Remove { dependency },
+    };
+
+    app::run(&provider, &project_root, command)
+}
