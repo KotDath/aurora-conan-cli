@@ -1,7 +1,6 @@
 mod app;
 mod clear_store;
 mod conan;
-mod connection;
 mod files;
 mod mode;
 mod model;
@@ -24,17 +23,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Подключает SDK/PSDK окружение для Conan-операций.
-    Connect {
-        #[arg(long)]
-        mode: Option<String>,
-        #[arg(long)]
-        dir: Option<String>,
-    },
-
-    /// Отключает сохранённое SDK/PSDK окружение.
-    Disconnect,
-
     /// Подготавливает структуру Conan-интеграции в проекте.
     Init,
 
@@ -73,8 +61,6 @@ fn run_main() -> Result<()> {
     let provider = CliConanProvider;
 
     let command = match cli.command {
-        Commands::Connect { mode, dir } => CliCommand::Connect { mode, dir },
-        Commands::Disconnect => CliCommand::Disconnect,
         Commands::Init => CliCommand::Init,
         Commands::InitClear => CliCommand::InitClear,
         Commands::Add {

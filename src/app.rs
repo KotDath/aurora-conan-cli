@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -6,19 +6,13 @@ use console::style;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::clear_store::{self, ClearManifest};
-use crate::conan::ConanProvider;
-use crate::connection::{self, Connection, ConnectionMode};
+use crate::conan::{self, ConanProvider};
 use crate::files;
 use crate::mode::{self, ProjectMode};
-use crate::model::{ConanRef, ProjectMetadata};
+use crate::model::{ConanRef, PackageCppInfo, ProjectMetadata};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
-    Connect {
-        mode: Option<String>,
-        dir: Option<String>,
-    },
-    Disconnect,
     Init,
     InitClear,
     Add {
@@ -43,8 +37,6 @@ pub enum CliCommand {
 
 pub fn run(provider: &dyn ConanProvider, project_root: &Path, command: CliCommand) -> Result<()> {
     match command {
-        CliCommand::Connect { mode, dir } => connect(mode, dir)?,
-        CliCommand::Disconnect => disconnect()?,
         CliCommand::Init => init_conan_mode(project_root)?,
         CliCommand::InitClear => init_clear_mode(project_root)?,
         CliCommand::Add {
@@ -94,6 +86,7 @@ fn init_conan_mode(project_root: &Path) -> Result<()> {
         &ProjectMetadata {
             direct_pkg_modules: Vec::new(),
             shared_lib_patterns: Vec::new(),
+            system_libs: Vec::new(),
         },
     )?;
     Ok(())
@@ -116,6 +109,7 @@ fn init_clear_mode(project_root: &Path) -> Result<()> {
         &ProjectMetadata {
             direct_pkg_modules: Vec::new(),
             shared_lib_patterns: Vec::new(),
+            system_libs: Vec::new(),
         },
     )?;
     Ok(())
@@ -215,6 +209,7 @@ fn remove_dependency(
                 ProjectMetadata {
                     direct_pkg_modules: Vec::new(),
                     shared_lib_patterns: Vec::new(),
+                    system_libs: Vec::new(),
                 }
             } else {
                 provider.resolve_project_metadata(project_root, &current)?
@@ -276,6 +271,7 @@ fn sync_clear_mode(
             &ProjectMetadata {
                 direct_pkg_modules: Vec::new(),
                 shared_lib_patterns: Vec::new(),
+                system_libs: Vec::new(),
             },
         )?;
         log_info(
@@ -295,6 +291,8 @@ fn sync_clear_mode(
         ),
     );
     let mut lib_patterns = Vec::new();
+    let mut all_system_libs = Vec::new();
+    let mut pkg_modules = Vec::new();
     let arch_ops_total = (all_refs.len() * target_arches.len()).max(1) as u64;
     let package_progress =
         create_progress_bar(arch_ops_total, "Downloading and extracting packages");
@@ -304,6 +302,19 @@ fn sync_clear_mode(
             Some(&package_progress),
             &format!("Processing {}", reference.to_ref_string()),
         );
+
+        // Получаем cpp_info из conanfile.py
+        let cpp_info = match conan::fetch_cpp_info_from_artifactory(&reference.name, &reference.version) {
+            Ok(info) => info,
+            Err(_) => {
+                // Fallback к пустому cpp_info если не удалось получить
+                PackageCppInfo {
+                    package_name: reference.name.clone(),
+                    ..Default::default()
+                }
+            }
+        };
+
         let artifacts = provider.download_dependency_archives(
             &reference.name,
             &reference.version,
@@ -333,14 +344,108 @@ fn sync_clear_mode(
                 clear_store::package_root(project_root, arch, &reference.name, &reference.version);
             clear_store::extract_tgz(&selected.path, &package_dir)?;
 
-            let libs = clear_store::discover_lib_names(&package_dir)?;
-            for lib in &libs {
+            // Обнаруживаем библиотеки из файловой системы как fallback
+            let discovered_libs = clear_store::discover_lib_names(&package_dir)?;
+
+            // Объединяем libs из cpp_info с обнаруженными libs
+            let mut combined_libs = cpp_info.libs.clone();
+            for lib in &discovered_libs {
+                if !combined_libs.contains(lib) {
+                    combined_libs.push(lib.clone());
+                }
+            }
+
+            for lib in &combined_libs {
                 let pattern = format!("lib{}.*", lib);
                 if !lib_patterns.iter().any(|item| item == &pattern) {
                     lib_patterns.push(pattern);
                 }
             }
-            clear_store::write_pkg_config(project_root, arch, reference, &libs, &[])?;
+
+            // Генерируем .pc файлы
+            if !cpp_info.components.is_empty() {
+                // Пакет с компонентами - генерируем .pc для каждого компонента
+                for component in &cpp_info.components {
+                    // Определяем sibling .pc имена для Requires
+                    let sibling_pc_names: Vec<String> = component
+                        .requires
+                        .iter()
+                        .filter_map(|req| {
+                            // Находим компонент с таким именем и берём его pkg_config_name
+                            cpp_info.components.iter().find_map(|c| {
+                                if &c.name == req {
+                                    Some(
+                                        c.pkg_config_name
+                                            .clone()
+                                            .unwrap_or_else(|| c.name.clone()),
+                                    )
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .collect();
+
+                    clear_store::write_component_pkg_config(
+                        project_root,
+                        arch,
+                        reference,
+                        component,
+                        &sibling_pc_names,
+                    )?;
+                }
+
+                // Собираем pkg_config_name для модулей из компонентов
+                let is_direct = direct_refs.iter().any(|d| d.name == reference.name);
+                if is_direct {
+                    // Для прямых зависимостей с компонентами используем имена компонентов
+                    for component in &cpp_info.components {
+                        let pc_name = component
+                            .pkg_config_name
+                            .clone()
+                            .unwrap_or_else(|| component.name.clone());
+                        if !pkg_modules.contains(&pc_name) {
+                            pkg_modules.push(pc_name);
+                        }
+                    }
+                }
+            } else {
+                // Пакет без компонентов - один .pc файл
+                // Создаём cpp_info с объединёнными libs для записи .pc
+                let pkg_cpp_info = PackageCppInfo {
+                    libs: combined_libs,
+                    system_libs: cpp_info.system_libs.clone(),
+                    ..cpp_info.clone()
+                };
+                clear_store::write_pkg_config(project_root, arch, reference, &pkg_cpp_info, &[])?;
+
+                // Добавляем pkg_config_name в модули для прямых зависимостей
+                let is_direct = direct_refs.iter().any(|d| d.name == reference.name);
+                if is_direct {
+                    let pc_name = cpp_info
+                        .pkg_config_name
+                        .clone()
+                        .unwrap_or_else(|| reference.name.clone());
+                    if !pkg_modules.contains(&pc_name) {
+                        pkg_modules.push(pc_name);
+                    }
+                }
+            }
+
+            // Собираем системные библиотеки
+            for sys_lib in &cpp_info.system_libs {
+                if !all_system_libs.contains(sys_lib) {
+                    all_system_libs.push(sys_lib.clone());
+                }
+            }
+            for component in &cpp_info.components {
+                for sys_lib in &component.system_libs {
+                    if !all_system_libs.contains(sys_lib) {
+                        all_system_libs.push(sys_lib.clone());
+                    }
+                }
+            }
+
             package_progress.inc(1);
         }
 
@@ -354,30 +459,30 @@ fn sync_clear_mode(
     }
     package_progress.finish_with_message(format!("{} packages synced", style("✔").green()));
 
-    let mut pkg_modules = all_refs
-        .iter()
-        .map(|item| item.name.clone())
-        .collect::<Vec<_>>();
+    lib_patterns.sort();
+    lib_patterns.dedup();
+    all_system_libs.sort();
+    all_system_libs.dedup();
     pkg_modules.sort();
     pkg_modules.dedup();
 
-    lib_patterns.sort();
-    lib_patterns.dedup();
     let module_count = pkg_modules.len();
     let pattern_count = lib_patterns.len();
+    let system_lib_count = all_system_libs.len();
 
     apply_clear_changes(
         project_root,
         &ProjectMetadata {
             direct_pkg_modules: pkg_modules,
             shared_lib_patterns: lib_patterns,
+            system_libs: all_system_libs,
         },
     )?;
     log_info(
         main_progress,
         &format!(
-            "Updated CMake/spec: modules={}, shared_lib_patterns={}",
-            module_count, pattern_count
+            "Updated CMake/spec: modules={}, shared_lib_patterns={}, system_libs={}",
+            module_count, pattern_count, system_lib_count
         ),
     );
     Ok(())
@@ -419,52 +524,6 @@ fn build_full_dependency_set(
     Ok(all)
 }
 
-fn connect(mode: Option<String>, dir: Option<String>) -> Result<()> {
-    let mode = match mode {
-        Some(value) => parse_mode(&value)?,
-        None => prompt_mode()?,
-    };
-
-    let path_value = match dir {
-        Some(value) => value,
-        None => prompt_path()?,
-    };
-
-    let path = Path::new(&path_value)
-        .canonicalize()
-        .with_context(|| format!("Не удалось определить путь {}", path_value))?;
-    if !path.is_dir() {
-        return Err(anyhow!("Путь {} не является директорией", path.display()));
-    }
-
-    match mode {
-        ConnectionMode::Sdk => {
-            let key = path
-                .join("vmshare")
-                .join("ssh")
-                .join("private_keys")
-                .join("sdk");
-            if !key.exists() {
-                return Err(anyhow!("Для sdk-режима не найден ключ {}", key.display()));
-            }
-        }
-        ConnectionMode::Psdk => {
-            let chroot = path.join("sdk-chroot");
-            if !chroot.exists() {
-                return Err(anyhow!("Для psdk-режима не найден {}", chroot.display()));
-            }
-        }
-    }
-
-    let connection = Connection { mode, path };
-    connection::save(&connection)?;
-    Ok(())
-}
-
-fn disconnect() -> Result<()> {
-    connection::clear()
-}
-
 fn ensure_project_files_exist(project_root: &Path) -> Result<()> {
     let cmake = project_root.join(files::CMAKE_FILE);
     if !cmake.exists() {
@@ -495,46 +554,6 @@ fn apply_clear_changes(project_root: &Path, metadata: &ProjectMetadata) -> Resul
     files::update_cmake_clear(project_root, metadata)?;
     files::update_spec_clear(project_root, metadata)?;
     Ok(())
-}
-
-fn parse_mode(value: &str) -> Result<ConnectionMode> {
-    match value.to_lowercase().as_str() {
-        "sdk" => Ok(ConnectionMode::Sdk),
-        "psdk" => Ok(ConnectionMode::Psdk),
-        _ => Err(anyhow!(
-            "Неизвестный режим '{}'. Допустимые значения: sdk, psdk",
-            value
-        )),
-    }
-}
-
-fn prompt_mode() -> Result<ConnectionMode> {
-    println!("Выберите окружение:");
-    println!("1) psdk");
-    println!("2) sdk");
-    print!("Ваш выбор [1/2]: ");
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    match input.trim() {
-        "1" | "psdk" | "PSDK" => Ok(ConnectionMode::Psdk),
-        "2" | "sdk" | "SDK" => Ok(ConnectionMode::Sdk),
-        _ => Err(anyhow!("Некорректный выбор окружения")),
-    }
-}
-
-fn prompt_path() -> Result<String> {
-    print!("Введите путь до SDK/PSDK: ");
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("Путь не может быть пустым"));
-    }
-    Ok(trimmed.to_string())
 }
 
 fn create_progress_bar(total: u64, message: impl Into<String>) -> ProgressBar {
@@ -767,7 +786,6 @@ mod tests {
     fn setup_project() -> Result<(TempDir, FakeProvider)> {
         let temp = tempfile::tempdir()?;
         fs::create_dir_all(temp.path().join("rpm"))?;
-        fs::write(temp.path().join("sdk-chroot"), "#!/bin/sh\nexit 0\n")?;
 
         fs::write(
             temp.path().join("CMakeLists.txt"),
@@ -820,6 +838,7 @@ Test app
                     ProjectMetadata {
                         direct_pkg_modules: Vec::new(),
                         shared_lib_patterns: Vec::new(),
+                        system_libs: Vec::new(),
                     },
                 ),
                 (
@@ -830,6 +849,7 @@ Test app
                             "libavcodec.*".to_string(),
                             "libavutil.*".to_string(),
                         ],
+                        system_libs: Vec::new(),
                     },
                 ),
                 (
@@ -837,6 +857,7 @@ Test app
                     ProjectMetadata {
                         direct_pkg_modules: vec!["a".to_string()],
                         shared_lib_patterns: vec!["liba.*".to_string(), "libb.*".to_string()],
+                        system_libs: Vec::new(),
                     },
                 ),
                 (
@@ -848,6 +869,7 @@ Test app
                             "libb.*".to_string(),
                             "libc.*".to_string(),
                         ],
+                        system_libs: Vec::new(),
                     },
                 ),
             ]),
@@ -1060,43 +1082,6 @@ Test app
         let refs = files::read_requires(project.path())?;
         assert_eq!(refs.len(), 1);
 
-        Ok(())
-    }
-
-    #[test]
-    fn connect_and_disconnect_manage_global_state_file() -> Result<()> {
-        let (project, provider) = setup_project()?;
-        let state_root = project.path().join("state-root");
-        fs::create_dir_all(&state_root)?;
-        // SAFETY: test-only process-local environment override.
-        unsafe {
-            std::env::set_var(
-                "AURORA_CONAN_CLI_STATE_DIR",
-                state_root.to_string_lossy().to_string(),
-            );
-        }
-
-        run(
-            &provider,
-            project.path(),
-            CliCommand::Connect {
-                mode: Some("psdk".to_string()),
-                dir: Some(project.path().display().to_string()),
-            },
-        )?;
-
-        let state_path = state_root.join("aurora-conan-cli/connection.json");
-        let content = fs::read_to_string(&state_path)
-            .with_context(|| format!("Нет {}", state_path.display()))?;
-        assert!(content.contains("\"mode\": \"psdk\""));
-
-        run(&provider, project.path(), CliCommand::Disconnect)?;
-        assert!(!state_path.exists());
-
-        // SAFETY: rollback environment override set above.
-        unsafe {
-            std::env::remove_var("AURORA_CONAN_CLI_STATE_DIR");
-        }
         Ok(())
     }
 

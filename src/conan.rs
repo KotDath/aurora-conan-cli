@@ -1,7 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
@@ -13,8 +12,7 @@ use reqwest::Url;
 use reqwest::blocking::Client;
 use serde_json::Value;
 
-use crate::connection::{self, Connection, ConnectionMode};
-use crate::model::{ConanRef, DownloadArtifact, ProjectMetadata};
+use crate::model::{ComponentInfo, ConanRef, DownloadArtifact, PackageCppInfo, ProjectMetadata};
 
 const DEFAULT_USER: &str = "aurora";
 const ERROR_VERSION: &str = "error";
@@ -223,6 +221,7 @@ impl ConanProvider for CliConanProvider {
             return Ok(ProjectMetadata {
                 direct_pkg_modules: Vec::new(),
                 shared_lib_patterns: Vec::new(),
+                system_libs: Vec::new(),
             });
         }
 
@@ -251,6 +250,7 @@ impl ConanProvider for CliConanProvider {
         Ok(ProjectMetadata {
             direct_pkg_modules: direct_modules,
             shared_lib_patterns: patterns,
+            system_libs: Vec::new(),
         })
     }
 }
@@ -779,6 +779,209 @@ fn fetch_conanfile_from_artifactory(package_name: &str, version: &str) -> Result
         .with_context(|| format!("HTTP ошибка при чтении {}", url.as_str()))?
         .text()
         .with_context(|| format!("Не удалось прочитать {}", url.as_str()))
+}
+
+/// Извлекает cpp_info из conanfile.py пакета
+pub fn fetch_cpp_info_from_artifactory(package_name: &str, version: &str) -> Result<PackageCppInfo> {
+    let conanfile = fetch_conanfile_from_artifactory(package_name, version)?;
+    Ok(parse_cpp_info_from_text(package_name, &conanfile))
+}
+
+/// Парсит cpp_info метаданные из текста conanfile.py
+pub fn parse_cpp_info_from_text(package_name: &str, conanfile: &str) -> PackageCppInfo {
+    let mut info = PackageCppInfo {
+        package_name: package_name.to_string(),
+        ..Default::default()
+    };
+
+    // Проверяем header-library
+    let header_only_re = Regex::new(r#"package_type\s*=\s*["']header-library["']"#)
+        .unwrap_or_else(|e| {
+            eprintln!("Warning: failed to compile header_only regex: {e}");
+            Regex::new(r"^$").unwrap()
+        });
+    info.is_header_only = header_only_re.is_match(conanfile);
+
+    // Парсим корневые libs
+    if let Some(libs) = parse_string_list(conanfile, r#"cpp_info\.libs\s*=\s*\[([^\]]*)\]"#) {
+        info.libs = libs;
+    }
+
+    // Парсим корневые system_libs (= [...])
+    if let Some(system_libs) = parse_string_list(conanfile, r#"cpp_info\.system_libs\s*=\s*\[([^\]]*)\]"#) {
+        info.system_libs = system_libs;
+    }
+
+    // Парсим корневые system_libs.append("...")
+    let append_re = Regex::new(r#"cpp_info\.system_libs\.append\(\s*["']([^"']+)["']\s*\)"#)
+        .unwrap_or_else(|e| {
+            eprintln!("Warning: failed to compile system_libs.append regex: {e}");
+            Regex::new(r"^$").unwrap()
+        });
+    for caps in append_re.captures_iter(conanfile) {
+        let lib = caps[1].to_string();
+        if !info.system_libs.contains(&lib) {
+            info.system_libs.push(lib);
+        }
+    }
+
+    // Парсим корневые system_libs.extend([...])
+    if let Some(system_libs) = parse_string_list(conanfile, r#"cpp_info\.system_libs\.extend\(\s*\[([^\]]*)\]\s*\)"#) {
+        for lib in system_libs {
+            if !info.system_libs.contains(&lib) {
+                info.system_libs.push(lib);
+            }
+        }
+    }
+
+    // Парсим pkg_config_name для корня
+    let pkg_name_re = Regex::new(r#"cpp_info\.set_property\(\s*["']pkg_config_name["']\s*,\s*["']([^"']+)["']\s*\)"#)
+        .unwrap_or_else(|e| {
+            eprintln!("Warning: failed to compile pkg_config_name regex: {e}");
+            Regex::new(r"^$").unwrap()
+        });
+    if let Some(caps) = pkg_name_re.captures(conanfile) {
+        info.pkg_config_name = Some(caps[1].to_string());
+    }
+
+    // Парсим компоненты
+    info.components = parse_components(conanfile);
+
+    info
+}
+
+/// Парсит список строк из Python-массива в conanfile
+fn parse_string_list(content: &str, pattern: &str) -> Option<Vec<String>> {
+    let re = Regex::new(pattern).ok()?;
+    let caps = re.captures(content)?;
+    let array_content = caps.get(1)?.as_str();
+
+    let mut result = Vec::new();
+    // Парсим строки в одинарных или двойных кавычках
+    let string_re = Regex::new(r#"["']([^"']*)["']"#).ok()?;
+    for str_caps in string_re.captures_iter(array_content) {
+        let s = str_caps[1].trim().to_string();
+        if !s.is_empty() && !result.contains(&s) {
+            result.push(s);
+        }
+    }
+    Some(result)
+}
+
+/// Парсит компоненты из conanfile.py
+fn parse_components(conanfile: &str) -> Vec<ComponentInfo> {
+    let mut components: Vec<ComponentInfo> = Vec::new();
+
+    // Находим все объявления компонентов: cpp_info.components["name"]
+    let component_decl_re = Regex::new(r#"cpp_info\.components\["([^"]+)"\]"#)
+        .unwrap_or_else(|e| {
+            eprintln!("Warning: failed to compile component_decl regex: {e}");
+            Regex::new(r"^$").unwrap()
+        });
+
+    let mut component_names: Vec<String> = Vec::new();
+    for caps in component_decl_re.captures_iter(conanfile) {
+        let name = caps[1].to_string();
+        if !component_names.contains(&name) {
+            component_names.push(name);
+        }
+    }
+
+    for name in component_names {
+        let mut component = ComponentInfo {
+            name: name.clone(),
+            ..Default::default()
+        };
+
+        // Парсим libs компонента
+        let libs_pattern = format!(
+            r#"cpp_info\.components\["{}\"]\.libs\s*=\s*\[([^\]]*)\]"#,
+            regex::escape(&name)
+        );
+        if let Some(libs) = parse_string_list(conanfile, &libs_pattern) {
+            component.libs = libs;
+        }
+
+        // Парсим system_libs компонента (= [...])
+        let sys_libs_pattern = format!(
+            r#"cpp_info\.components\["{}\"]\.system_libs\s*=\s*\[([^\]]*)\]"#,
+            regex::escape(&name)
+        );
+        if let Some(system_libs) = parse_string_list(conanfile, &sys_libs_pattern) {
+            component.system_libs = system_libs;
+        }
+
+        // Парсим system_libs.append компонента
+        let append_pattern = format!(
+            r#"cpp_info\.components\["{}\"]\.system_libs\.append\(\s*["']([^"']+)["']\s*\)"#,
+            regex::escape(&name)
+        );
+        let append_re = Regex::new(&append_pattern).unwrap_or_else(|e| {
+            eprintln!("Warning: failed to compile component system_libs.append regex: {e}");
+            Regex::new(r"^$").unwrap()
+        });
+        for caps in append_re.captures_iter(conanfile) {
+            let lib = caps[1].to_string();
+            if !component.system_libs.contains(&lib) {
+                component.system_libs.push(lib);
+            }
+        }
+
+        // Парсим system_libs.extend компонента
+        let extend_pattern = format!(
+            r#"cpp_info\.components\["{}\"]\.system_libs\.extend\(\s*\[([^\]]*)\]\s*\)"#,
+            regex::escape(&name)
+        );
+        if let Some(system_libs) = parse_string_list(conanfile, &extend_pattern) {
+            for lib in system_libs {
+                if !component.system_libs.contains(&lib) {
+                    component.system_libs.push(lib);
+                }
+            }
+        }
+
+        // Парсим pkg_config_name компонента
+        let pkg_name_pattern = format!(
+            r#"cpp_info\.components\["{}\"]\.set_property\(\s*["']pkg_config_name["']\s*,\s*["']([^"']+)["']\s*\)"#,
+            regex::escape(&name)
+        );
+        let pkg_name_re = Regex::new(&pkg_name_pattern).unwrap_or_else(|e| {
+            eprintln!("Warning: failed to compile component pkg_config_name regex: {e}");
+            Regex::new(r"^$").unwrap()
+        });
+        if let Some(caps) = pkg_name_re.captures(conanfile) {
+            component.pkg_config_name = Some(caps[1].to_string());
+        }
+
+        // Парсим requires компонента (= [...])
+        let requires_pattern = format!(
+            r#"cpp_info\.components\["{}\"]\.requires\s*=\s*\[([^\]]*)\]"#,
+            regex::escape(&name)
+        );
+        if let Some(requires) = parse_string_list(conanfile, &requires_pattern) {
+            component.requires = requires;
+        }
+
+        // Парсим requires.append компонента
+        let req_append_pattern = format!(
+            r#"cpp_info\.components\["{}\"]\.requires\.append\(\s*["']([^"']+)["']\s*\)"#,
+            regex::escape(&name)
+        );
+        let req_append_re = Regex::new(&req_append_pattern).unwrap_or_else(|e| {
+            eprintln!("Warning: failed to compile component requires.append regex: {e}");
+            Regex::new(r"^$").unwrap()
+        });
+        for caps in req_append_re.captures_iter(conanfile) {
+            let req = caps[1].to_string();
+            if !component.requires.contains(&req) {
+                component.requires.push(req);
+            }
+        }
+
+        components.push(component);
+    }
+
+    components
 }
 
 fn parse_conaninfo_text(content: &str) -> (String, Vec<String>) {
@@ -1614,194 +1817,22 @@ fn select_dependency_version(
     Ok(available_versions[0].clone())
 }
 
-fn run_conan_with_connection(_project_root: &Path, conan_args: &[String]) -> Result<String> {
-    let connection = connection::load()?;
-    let target = pick_aarch64_target(&connection)?;
-    let conan_exec = resolve_conan_exec(&connection, &target)?;
-
-    let mut cmd = vec!["sb2".to_string(), "-t".to_string(), target, conan_exec];
-    cmd.extend(conan_args.iter().cloned());
-
-    run_in_connected_env(&connection, &cmd)
-}
-
-fn pick_aarch64_target(connection: &Connection) -> Result<String> {
-    let output = run_in_connected_env(
-        connection,
-        &["sdk-assistant".to_string(), "list".to_string()],
-    )
-    .context("Не удалось вызвать sdk-assistant list")?;
-
-    let target_re = Regex::new(r"AuroraOS-\S*-aarch64")
-        .context("Не удалось подготовить regex для поиска aarch64 target")?;
-
-    target_re
-        .find(&output)
-        .map(|m| m.as_str().to_string())
-        .ok_or_else(|| {
-            anyhow!("В выводе sdk-assistant list не найден target вида AuroraOS-*-aarch64")
-        })
-}
-
-fn resolve_conan_exec(connection: &Connection, target: &str) -> Result<String> {
-    let output = run_in_connected_env(
-        connection,
-        &[
-            "sb2".to_string(),
-            "-t".to_string(),
-            target.to_string(),
-            "bash".to_string(),
-            "-lc".to_string(),
-            "if command -v conan-with-aurora-profile >/dev/null 2>&1; then echo conan-with-aurora-profile; elif command -v conan >/dev/null 2>&1; then echo conan; else echo none; fi".to_string(),
-        ],
-    )
-    .context("Не удалось определить исполняемый файл conan")?;
-
-    let exec = output.trim();
-    match exec {
-        "conan-with-aurora-profile" | "conan" => Ok(exec.to_string()),
-        _ => Err(anyhow!(
-            "Не найден conan-with-aurora-profile/conan в подключенном окружении"
-        )),
-    }
-}
-
-fn run_in_connected_env(connection: &Connection, args: &[String]) -> Result<String> {
-    match connection.mode {
-        ConnectionMode::Sdk => run_in_sdk_over_ssh(connection, args),
-        ConnectionMode::Psdk => run_in_psdk_chroot(connection, args),
-    }
-}
-
-fn run_in_sdk_over_ssh(connection: &Connection, args: &[String]) -> Result<String> {
-    let remote_cmd = args
-        .iter()
-        .map(|s| shell_quote(s))
-        .collect::<Vec<_>>()
-        .join(" ");
-    run_ssh_script(connection, &format!("set -euo pipefail\n{}", remote_cmd))
-}
-
-fn run_ssh_script(connection: &Connection, script: &str) -> Result<String> {
-    let key_path = connection
-        .path
-        .join("vmshare")
-        .join("ssh")
-        .join("private_keys")
-        .join("sdk");
-    if !key_path.exists() {
-        return Err(anyhow!("Не найден SSH ключ {}", key_path.display()));
-    }
-
-    let remote = format!("bash -lc {}", shell_quote(script));
-    let output = Command::new("ssh")
-        .arg("-p")
-        .arg("2232")
-        .arg("-i")
-        .arg(&key_path)
-        .arg("mersdk@localhost")
-        .arg(remote)
-        .output()
-        .context("Не удалось выполнить ssh-подключение к SDK")?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(anyhow!(
-            "Команда в SDK завершилась с кодом {:?}: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-fn run_in_psdk_chroot(connection: &Connection, args: &[String]) -> Result<String> {
-    let chroot = connection.path.join("sdk-chroot");
-    if !chroot.exists() {
-        return Err(anyhow!("Не найден {}", chroot.display()));
-    }
-
-    let output = Command::new(&chroot)
-        .args(args)
-        .output()
-        .with_context(|| format!("Не удалось запустить {}", chroot.display()))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(anyhow!(
-            "Команда в PSDK завершилась с кодом {:?}: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-fn shell_quote(input: &str) -> String {
-    format!("'{}'", input.replace('\'', "'\"'\"'"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     use anyhow::{Result, anyhow};
     use serde_json::Value;
-    use tempfile::tempdir;
 
     use super::{
         DependencyConstraint, DependencyDataSource, VersionMatcher, filter_package_names_by_query,
         normalize_download_url, parse_artifactory_storage_versions, parse_dependency_constraint,
         parse_dependency_constraints_from_version_node, parse_latest_revision_from_index,
         parse_package_download_sources, parse_package_names_html, parse_package_versions_html,
-        parse_version_matcher, parse_versions_from_next_data, pick_aarch64_target,
-        resolve_conan_exec, resolve_dependency_graph, resolve_exact_without_remote_lookup,
-        sanitize_arch_for_filename, select_dependency_version, select_version_for_constraints,
+        parse_version_matcher, parse_versions_from_next_data, resolve_dependency_graph,
+        resolve_exact_without_remote_lookup, sanitize_arch_for_filename, select_dependency_version,
+        select_version_for_constraints,
     };
-    use crate::connection::{Connection, ConnectionMode};
-
-    #[test]
-    fn resolves_conan_exec_inside_sb2_target() -> Result<()> {
-        let tmp = tempdir()?;
-        let chroot = tmp.path().join("sdk-chroot");
-
-        let script = r#"#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ "${1:-}" == "sdk-assistant" && "${2:-}" == "list" ]]; then
-  echo "AuroraOS-5.1.5.105-MB2-aarch64"
-  exit 0
-fi
-
-if [[ "${1:-}" == "sb2" && "${2:-}" == "-t" ]]; then
-  if [[ "${4:-}" == "bash" && "${5:-}" == "-lc" ]]; then
-    if [[ "${6:-}" == *"command -v conan-with-aurora-profile"* ]]; then
-      echo "conan-with-aurora-profile"
-      exit 0
-    fi
-  fi
-fi
-
-echo "unexpected call: $*" >&2
-exit 1
-"#;
-        fs::write(&chroot, script)?;
-        let mut perms = fs::metadata(&chroot)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&chroot, perms)?;
-
-        let connection = Connection {
-            mode: ConnectionMode::Psdk,
-            path: tmp.path().to_path_buf(),
-        };
-
-        let target = pick_aarch64_target(&connection)?;
-        let exec = resolve_conan_exec(&connection, &target)?;
-        assert_eq!(exec, "conan-with-aurora-profile");
-        Ok(())
-    }
 
     #[test]
     fn parses_versions_from_version_select_block() -> Result<()> {
@@ -2271,6 +2302,124 @@ exit 1
         let revision = parse_latest_revision_from_index(&payload)?;
         assert_eq!(revision, "newest");
         Ok(())
+    }
+
+    #[test]
+    fn test_parse_simple_cpp_info() {
+        let conanfile = r#"
+from conan import ConanFile
+
+class SomePackage(ConanFile):
+    name = "testpkg"
+    version = "1.0.0"
+
+    def package_info(self):
+        self.cpp_info.libs = ["testpkg"]
+"#;
+        let info = super::parse_cpp_info_from_text("testpkg", conanfile);
+        assert_eq!(info.package_name, "testpkg");
+        assert_eq!(info.libs, vec!["testpkg"]);
+        assert!(!info.is_header_only);
+        assert!(info.components.is_empty());
+    }
+
+    #[test]
+    fn test_parse_system_libs() {
+        let conanfile = r#"
+from conan import ConanFile
+
+class SomePackage(ConanFile):
+    def package_info(self):
+        self.cpp_info.libs = ["mylib"]
+        self.cpp_info.system_libs = ["pthread", "dl"]
+        self.cpp_info.system_libs.append("m")
+        self.cpp_info.system_libs.extend(["rt", "dl"])
+"#;
+        let info = super::parse_cpp_info_from_text("mylib", conanfile);
+        assert_eq!(info.libs, vec!["mylib"]);
+        // dl appears twice but should only be once
+        assert!(info.system_libs.contains(&"pthread".to_string()));
+        assert!(info.system_libs.contains(&"dl".to_string()));
+        assert!(info.system_libs.contains(&"m".to_string()));
+        assert!(info.system_libs.contains(&"rt".to_string()));
+    }
+
+    #[test]
+    fn test_parse_components() {
+        let conanfile = r#"
+from conan import ConanFile
+
+class OpensslConan(ConanFile):
+    def package_info(self):
+        self.cpp_info.components["ssl"].libs = ["ssl"]
+        self.cpp_info.components["ssl"].requires = ["crypto"]
+        self.cpp_info.components["ssl"].set_property("pkg_config_name", "libssl")
+
+        self.cpp_info.components["crypto"].libs = ["crypto"]
+        self.cpp_info.components["crypto"].system_libs = ["pthread", "dl", "rt"]
+        self.cpp_info.components["crypto"].set_property("pkg_config_name", "libcrypto")
+"#;
+        let info = super::parse_cpp_info_from_text("openssl", conanfile);
+        assert_eq!(info.components.len(), 2);
+
+        let crypto = info.components.iter().find(|c| c.name == "crypto").expect("crypto component");
+        assert_eq!(crypto.libs, vec!["crypto"]);
+        assert_eq!(crypto.system_libs, vec!["pthread", "dl", "rt"]);
+        assert_eq!(crypto.pkg_config_name, Some("libcrypto".to_string()));
+
+        let ssl = info.components.iter().find(|c| c.name == "ssl").expect("ssl component");
+        assert_eq!(ssl.libs, vec!["ssl"]);
+        assert_eq!(ssl.requires, vec!["crypto"]);
+        assert_eq!(ssl.pkg_config_name, Some("libssl".to_string()));
+    }
+
+    #[test]
+    fn test_parse_pkg_config_name() {
+        let conanfile = r#"
+from conan import ConanFile
+
+class CurlConan(ConanFile):
+    def package_info(self):
+        self.cpp_info.libs = ["curl"]
+        self.cpp_info.set_property("pkg_config_name", "libcurl")
+"#;
+        let info = super::parse_cpp_info_from_text("libcurl", conanfile);
+        assert_eq!(info.pkg_config_name, Some("libcurl".to_string()));
+    }
+
+    #[test]
+    fn test_parse_header_only() {
+        let conanfile = r#"
+from conan import ConanFile
+
+class HeaderOnlyConan(ConanFile):
+    package_type = "header-library"
+
+    def package_info(self):
+        self.cpp_info.bindirs = []
+        self.cpp_info.libdirs = []
+"#;
+        let info = super::parse_cpp_info_from_text("header_only", conanfile);
+        assert!(info.is_header_only);
+        assert!(info.libs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_component_system_libs_append() {
+        let conanfile = r#"
+from conan import ConanFile
+
+class SomeConan(ConanFile):
+    def package_info(self):
+        self.cpp_info.components["main"].libs = ["main"]
+        self.cpp_info.components["main"].system_libs.append("pthread")
+        self.cpp_info.components["main"].system_libs.append("dl")
+"#;
+        let info = super::parse_cpp_info_from_text("some", conanfile);
+        assert_eq!(info.components.len(), 1);
+        let comp = &info.components[0];
+        assert!(comp.system_libs.contains(&"pthread".to_string()));
+        assert!(comp.system_libs.contains(&"dl".to_string()));
     }
 }
 
